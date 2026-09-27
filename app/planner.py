@@ -221,6 +221,14 @@ def _solve_word(table, word):
     same ``(width, uncontracted)`` and the same emitted cell stream collapse
     into one; distinct streams at equal cost are both retained because the
     global planner can only resolve them at pagination time.
+
+    The DP is iterative: every suffix at ``pos`` depends only on strictly
+    larger positions (a rule match jumps by its key length, the grade-1
+    fallback advances by one), so the suffix frontiers are filled from the
+    end of the word backwards.  The call stack stays flat no matter how long
+    the word is -- a single whitespace-free word may be as long as the
+    document grapheme limit without approaching the interpreter's recursion
+    limit (the former recursive solver overflowed it past ~1000 clusters).
     """
     k = len(word)
     starts, end = [], 0
@@ -231,28 +239,16 @@ def _solve_word(table, word):
     def coff(i):
         return (starts[i], starts[i + 1] if i + 1 < k else end)
 
-    memo = {}
-
     def stream_key(cells):
         return tuple((c[0], c[5] or "") for c in cells)
 
-    def solve(pos):
-        if pos == k:
-            return [(0, [], 0)]
-        if pos in memo:
-            return memo[pos]
-        candidates = {}
-        for m in table.matches_at(word, pos):
-            n = len(m["key"])
-            for tw, tcells, tu in solve(pos + n):
-                cells = [
-                    (c, pos, pos + n, coff(pos)[0], coff(pos + n - 1)[1],
-                     m["id"])
-                    for c in m["cells"]
-                ] + tcells
-                cand = (len(m["cells"]) + tw, cells, tu)
-                candidates.setdefault((cand[0], cand[2], stream_key(cells)),
-                                      cand)
+    # solved[pos] is the Pareto frontier for the suffix word[pos:], or None
+    # when that suffix cannot be rendered -- one slot per position instead
+    # of one recursion frame per grapheme.
+    solved = [None] * (k + 1)
+    solved[k] = [(0, [], 0)]
+    for pos in range(k - 1, -1, -1):
+        matches = table.matches_at(word, pos)
         masks, kind = table.char_cells(word[pos])
         cs, ce = coff(pos)
         prev_digit = pos > 0 and table.char_cells(word[pos - 1])[1] == "digit"
@@ -262,13 +258,35 @@ def _solve_word(table, word):
         for msk in masks:
             cells.append((msk, pos, pos + 1, cs, ce, None))
         add_u = 0 if kind == "digit" else 1
-        for tw, tcells, tu in solve(pos + 1):
+        tail = solved[pos + 1]
+        if not matches and len(tail) == 1:
+            # A lone candidate: the dedup key, the Pareto pass and the
+            # final sort below are all identity transforms for a single
+            # option, so the stream key never needs to be materialized.
+            # (This keeps a rule-free word of N clusters at O(N) stream-key
+            # work instead of O(N^2); the emitted option is unchanged.)
+            tw, tcells, tu = tail[0]
+            solved[pos] = [(len(cells) + tw, cells + tcells, add_u + tu)]
+            continue
+        candidates = {}
+        for m in matches:
+            n = len(m["key"])
+            for tw, tcells, tu in solved[pos + n]:
+                mcells = [
+                    (c, pos, pos + n, coff(pos)[0], coff(pos + n - 1)[1],
+                     m["id"])
+                    for c in m["cells"]
+                ] + tcells
+                cand = (len(m["cells"]) + tw, mcells, tu)
+                candidates.setdefault(
+                    (cand[0], cand[2], stream_key(mcells)), cand)
+        for tw, tcells, tu in tail:
             full = cells + tcells
             cand = (len(cells) + tw, full, add_u + tu)
             candidates.setdefault((cand[0], cand[2], stream_key(full)), cand)
         if not candidates:
-            memo[pos] = None
-            return None
+            solved[pos] = None
+            continue
         options = list(candidates.values())
         # Pareto pruning on (width, uncontracted): keep an option unless
         # another is no wider, needs no more spelled cells and is strictly
@@ -283,10 +301,9 @@ def _solve_word(table, word):
             if not dominated:
                 kept.append((w, c, u))
         kept.sort(key=lambda r: (r[0], r[2], stream_key(r[1])))
-        memo[pos] = kept
-        return kept
+        solved[pos] = kept
 
-    options = solve(0)
+    options = solved[0]
     if options is None:
         raise InputError("word could not be rendered in braille")
     return options
