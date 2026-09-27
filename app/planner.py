@@ -231,20 +231,24 @@ def _solve_word(table, word):
     def coff(i):
         return (starts[i], starts[i + 1] if i + 1 < k else end)
 
-    memo = {}
-
     def stream_key(cells):
         return tuple((c[0], c[5] or "") for c in cells)
 
-    def solve(pos):
-        if pos == k:
-            return [(0, [], 0)]
-        if pos in memo:
-            return memo[pos]
+    # Iterative form of the former memoized recursion ``solve(pos)``: every
+    # subproblem depends only on strictly larger positions (rule matches
+    # consume n >= 1 clusters, the grade-1 fallback consumes one), so
+    # filling the table back-to-front computes exactly the same values
+    # without consuming call-stack depth -- a whitespace-delimited word of
+    # a few thousand graphemes used to exhaust the interpreter's recursion
+    # limit.  ``memo[pos]`` is either a non-empty option list or None (no
+    # segmentation); the base case is position k.
+    memo = [None] * (k + 1)
+    memo[k] = [(0, [], 0)]
+    for pos in range(k - 1, -1, -1):
         candidates = {}
         for m in table.matches_at(word, pos):
             n = len(m["key"])
-            for tw, tcells, tu in solve(pos + n):
+            for tw, tcells, tu in memo[pos + n]:
                 cells = [
                     (c, pos, pos + n, coff(pos)[0], coff(pos + n - 1)[1],
                      m["id"])
@@ -262,13 +266,13 @@ def _solve_word(table, word):
         for msk in masks:
             cells.append((msk, pos, pos + 1, cs, ce, None))
         add_u = 0 if kind == "digit" else 1
-        for tw, tcells, tu in solve(pos + 1):
+        for tw, tcells, tu in memo[pos + 1]:
             full = cells + tcells
             cand = (len(cells) + tw, full, add_u + tu)
             candidates.setdefault((cand[0], cand[2], stream_key(full)), cand)
         if not candidates:
             memo[pos] = None
-            return None
+            continue
         options = list(candidates.values())
         # Pareto pruning on (width, uncontracted): keep an option unless
         # another is no wider, needs no more spelled cells and is strictly
@@ -284,9 +288,8 @@ def _solve_word(table, word):
                 kept.append((w, c, u))
         kept.sort(key=lambda r: (r[0], r[2], stream_key(r[1])))
         memo[pos] = kept
-        return kept
 
-    options = solve(0)
+    options = memo[0]
     if options is None:
         raise InputError("word could not be rendered in braille")
     return options
